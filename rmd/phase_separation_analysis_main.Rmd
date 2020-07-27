@@ -1,0 +1,292 @@
+---
+title: "Phase_separation_analysis_main"
+author: "LTT"
+date: "8/23/2019"
+output: 
+  html_document: 
+    highlight: pygments
+    theme: readable
+    toc: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+## 1. protein sequence subtraction and scoring  
+
+### 1.1 Clean up protein sequences  
+
+- 1.1.1 First, download all protein-coding gene sequences form ensembl:  
+<http://asia.ensembl.org/info/data/ftp/index.html>  
+
+- 1.1.2 Second,Only keep the largest protein isoform sequences for each genes.  
+    + Abandon proteins whose lengths less than 100.  
+    + Pick up the first isoform if over 1 isofroms have the same length.  
+    + Generate another clean fa table which peptides do not contain asterix. "*" need to be removed for AA analysis.
+
+
+```
+ensemble_peps <- readAAStringSet(
+	'~/data/public/ensembl/protein_peptides/Homo_sapiens.GRCh38.pep.all.fa')
+ensemble_peps <- ensemble_peps[width(ensemble_peps) > 100]
+
+names(ensemble_peps) <- names(ensemble_peps)  %>% strsplit(split = ' ') %>% 
+	unlist %>% grep(pattern = 'gene_symbol', x = ., value = T)
+
+#Generate the data.table and only keep the longest peptide for each gene:
+ensemble_peps_dt <- data.table(gene_symbol = names(ensemble_peps),
+                               seq = as.character(ensemble_peps))
+ensemble_peps_dt[, length := nchar(seq)]
+ensemble_peps_dt_longest <- ensemble_peps_dt[, .SD[which.max(length)], 
+											 by = 'gene_symbol']
+				
+peps_clean <- AAStringSet(ensemble_peps_dt_longest[, seq])
+names(peps_clean) <- ensemble_peps_dt_longest[, gene_symbol]
+writeXStringSet(peps_clean, 
+				filepath = './results/fa/human/all_protein_coding_genes_aa_sequence.fa')
+
+for (i in seq(1, length(peps_clean))) {
+    gene_name <- names(peps_clean[i]) %>% gsub('gene_symbol:', "", x = .)
+    file_name <- sprintf('./results/fa/human/separate_fa/%s_aa_seq.fa', gene_name)
+    writeXStringSet(peps_clean[i], filepath = file_name)
+}
+
+```
+
+```
+#clean AA sequences with '*'
+clean_ensemble_peps <- ensemble_peps_dt_longest[!grepl('\\*', seq)]
+peps_clean_ensemble <- AAStringSet(clean_ensemble_peps[, seq])
+names(peps_clean_ensemble) <- clean_ensemble_peps[, gene_symbol]
+writeXStringSet(peps_clean_ensemble, 
+    filepath = './results/all_protein_coding_genes_without_asterix_aa_sequence.fa')
+
+peps_clean_ensemble <- readAAStringSet(
+	'./results/all_protein_coding_genes_without_asterix_aa_sequence.fa')
+
+for (i in seq(1, length(peps_clean_ensemble))) {
+	gene_name <- names(peps_clean_ensemble[i]) %>% gsub('gene_symbol:', "", x = .)
+	file_name <- sprintf('./results/separate_fa_wo_asterix/%s_aa_seq.fa', gene_name)
+	writeXStringSet(peps_clean_ensemble[i], filepath = file_name)
+}
+
+
+```
+
+- 1.1.3 An example of the clean fa results  
+```{bash}
+head ~/Desktop/projects/phase_separation/results/fa/human/all_protein_coding_genes_aa_sequence.fa
+```
+
+```{bash}
+head ~/Desktop/projects/phase_separation/results/fa/human/separate_fa_wo_asterix/TP53_aa_seq.fa
+```
+
+
+### 1.2 Calculate iupred2a scores for each gene  
+- 1.2.1 First calculate the score for each genes with the `iupred2a.py`script offered by the IUPred2A paper.  
+```
+#!/bin/bash
+#all proteinc_coding genes:
+AA_FAS=(`ls ./separate_fa | sort`)
+for i in ${AA_FAS[@]}
+do
+	GENE_NAME=`basename $i | sed 's/.fa//'`
+	python ~/bin/iupred2a.py -a ./separate_fa/$i long	> ./iupred2a_results/${GENE_NAME}.iupred2a.txt
+done
+
+```
+An example of iupred2a.py genereated output: 
+
+```{bash}
+head ~/Desktop/projects/phase_separation/results/iupred2a_results/human/AADAC.iupred2a.txt
+```
+
+- 1.2.2 Second calculate the LCD ratio according to the iupred2a scores together into a data.table  
+A amino acid is considered as LCD if the iupred2a score is over 0.5.
+
+```
+gene_score_list <- list.files(path = './results/iupred2a_results/human', full.names = T)
+names(gene_score_list) <- gsub('.iupred2a.txt', '', gene_score_list %>% basename)
+
+
+Score_Calculation <- function(file.path, cutoff = 0.5){
+    #Usage:
+    #   calculate the percentage of AAs that have a higher score over cutoff
+    #Input:
+    #   a file containing the results generate by iupred2a for one specific protein.
+    #output:
+    #   return a data.table in the follow form:
+    #       gene_symbol, percent_of_iupred2a, percent_of_anchor2
+    
+    gene.name <- basename(file.path) %>% gsub(pattern = '.iupred2a.txt', 
+                                              replacement = '')
+    gene.score <- fread(file.path)
+    names(gene.score) <-  c('location', 'AA', 'iupred2a_score', 'anchor2_score')
+    
+    return(data.table(
+        gene_symbol = gene.name,
+        percent_of_iupred2a = gene.score[iupred2a_score > 0.5, .N]/ gene.score[, .N],
+        percent_of_anchor2 = gene.score[anchor2_score > 0.5, .N]/ gene.score[, .N]) 
+    )
+}
+
+phase_score_dt <- data.table()
+for (i in seq(1, length(gene_score_list))) {
+    tmp <- Score_Calculation(gene_score_list[i])
+    phase_score_dt <- rbind(phase_score_dt, tmp)
+}
+
+#fwrite(phase_score_dt, file = './results/phase_percentag_all_protein_coding.txt', 
+#		sep = '\t')
+phase_score_dt <- fread(file = './results/phase_percentag_all_protein_coding.txt',
+						sep = '\t')
+
+phase_score_dt_0.3 <- phase_score_dt[percent_of_iupred2a > 0.3 & percent_of_anchor2 > 0.3]
+#fwrite(phase_score_dt_0.3[, .(gene_symbol)], 
+#       file ='./results/phase_separation_genelist_0.3.txt', col.names =F )
+
+phase_score_dt_0.4 <- phase_score_dt[percent_of_iupred2a > 0.4 & percent_of_anchor2 > 0.4]
+#fwrite(phase_score_dt_0.4[, .(gene_symbol)], 
+#       file ='./results/phase_separation_genelist_0.4.txt', col.names =F )
+```
+An example of the collected LCD ratio of genes:  
+
+```{bash}
+head ~/Desktop/projects/phase_separation/results/phase_percentag_all_protein_coding.txt
+```
+
+
+### 1.3 Calculate the charges of each genes by cider  
+
+Calculate the FCR and NCPR of each genes by `localcider` python package.  
+The AA sequences should not contain asterix.  
+
+```
+#!/bin/python
+#http://pappulab.github.io/localCIDER/
+import os
+import localcider
+from localcider.sequenceParameters import SequenceParameters
+import pysam
+wd = '/Users/xuejia/Desktop/projects/phase_separation_cancer/'
+
+aa_seqs = pysam.FastaFile(wd +
+    'results/all_protein_coding_genes_without_asterix_aa_sequence.fa')
+
+aa_seqs.lengths[:3]
+aa_seqs.references[:5]
+aa_seqs.nreferences
+aa_seqs.closed
+
+for i in range(aa_seqs.nreferences):
+    try:
+        SP = SequenceParameters(aa_seqs.fetch(aa_seqs.references[i]))
+    except:
+        continue
+    gene_symbol = aa_seqs.references[i]
+    print(gene_symbol)
+    out_file = '/Users/xuejia/Desktop/projects/phase_separation_cancer/results/cider/human/%s.txt' % gene_symbol
+
+    with open(out_file, mode='w') as f:
+        f.write('amino_acid' + '\t' + 'FCR' + '\t' + 'NCPR' + '\n')
+        for i in range(len(SP.get_sequence())):
+            line = '\t'.join([SP.get_sequence()[i],
+                            str(SP.get_linear_FCR()[1][i]),
+                            str(SP.get_linear_NCPR()[1][i])])
+            f.write(line + '\n')
+
+aa_seqs.close()
+
+```
+
+
+### 1.4 Predict the motifs for each protein-coding gene  
+- Firstly get all predicted motifs by interproscan.  
+```
+sh ~/litt/software/interproscan/interproscan-5.31-70.0/interproscan.sh \
+	-i all_protein_coding_genes_without_asterix_aa_sequence.fa  \
+	-f tsv -f HTML -f GFF3 -f SVG
+```
+
+- Secondly clean up the interproscan results.  
+Only collect results generate by Pfam, SMART, SUPERFAMILY, MobiDBLite, PRINTS and Coils  
+
+```
+#!/bin/bash
+#clean up data:
+grep Pfam all_protein_coding_genes_without_asterix_aa_sequence.fa.tsv | cut -f1,3,4,6-8 | sed s/gene_symbol:// > clean_data/pfam_clean.txt
+grep SMART all_protein_coding_genes_without_asterix_aa_sequence.fa.tsv | awk -F "\t" {print $1\t$3\t$4\t$NF\t$7\t$8} | sed s/gene_symbol:// > clean_data/smart_clean.txt
+grep PRINTS all_protein_coding_genes_without_asterix_aa_sequence.fa.tsv |  cut -f1,3,4,6-8 | sed s/gene_symbol:// > clean_data/prints_clean.txt
+grep SUPERFAMILY all_protein_coding_genes_without_asterix_aa_sequence.fa.tsv | awk -F "\t" {print $1\t$3\t$4\t$NF\t$7\t$8} | sed s/gene_symbol:// | grep -v 23-11-2018 > clean_data/superfamily_clean.txt
+grep MobiDBLite all_protein_coding_genes_without_asterix_aa_sequence.fa.tsv | cut -f1,3,4,5,7-8 | sed s/gene_symbol:// | awk 'BEGIN{OFS="\t"}{$4="low complexity"; print}' > clean_data/MobiDBLite_clean.txt
+
+#merge together:
+cat clean_data/* | sort -k 1 >> clean_motifs_all_proteins.txt
+
+```
+Save the clean motif data into RDS:  
+```
+motifs <-fread(
+	'./results/interproscan/clean_data/clean_motifs_all_proteins.txt', sep = '\t')
+saveRDS(motifs, file = './results/rda/motifs_clean.rda')	
+```
+Show the head of cleaned motif data:  
+```{r}
+head 
+```
+
+
+
+- Thirdly, collect motif info into a column for each gene.  
+
+```
+
+```
+
+
+### 1.5 Merge data together  
+
+- Merge iupred2a scores and cider results together  
+```
+#generate clean dfs containing AA and iupred2 scores:
+gene_list <- list.files('./results/cider/human/') %>% gsub('.txt$', '', x = .)
+for (i in gene_list) {
+	print(i)
+	cider_path <- sprintf('./results/cider/human/%s.txt', i)
+	ps_path <- sprintf('./results/iupred2a_results/%s.iupred2a.txt', i)
+	cider <- fread(cider_path)
+	ps <- fread(ps_path)
+	names(ps) <- c('location', 'amino_acid', 'iupred2_score', 'achore2_score')
+	cider_ps <- cbind(cider, ps)
+	fwrite(cider_ps, file = sprintf(
+		'./results/aa_iupred_cider/human/AAs_iupred2a_scores_%s.txt', i), sep = '\t')
+}
+
+```
+An example of merged data format:  
+```{bash}
+head -5 ~/Desktop/projects/phase_separation/results/aa_iupred_cider/human/AAs_iupred2a_scores_TP53.txt
+```
+
+- Save the merged data into RDS  
+```
+#LCD scores by iupred2a:
+gene_list <- list.files('./results/aa_iupred_cider/human/') %>% 
+	gsub('AAs_iupred2a_scores_', '', x = .) %>% gsub('.txt', '', x =.)
+
+lcd_list <- lapply(gene_list, function(x){
+	fread(sprintf('./results/aa_iupred_scores/human/AAs_iupred2a_scores_%s.txt', x))})
+names(lcd_list) <- gene_list
+#saveRDS(lcd_list, file = './results/rda/lcd_list.rda')
+
+```
+
+
+
+
+
+
+#
